@@ -1,0 +1,75 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: openclaw-postgres
+    environment:
+      - POSTGRES_USER=openclaw
+      - POSTGRES_PASSWORD=openclaw123
+      - POSTGRES_DB=openclaw
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openclaw"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: openclaw-redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: openclaw-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://openclaw:openclaw123@postgres:5432/openclaw
+      - REDIS_URL=redis://redis:6379/0
+      - DEBUG=true
+      - JWT_SECRET_KEY=dev-secret-key-change-in-production
+      - ENCRYPTION_KEY=dev-encryption-key-32-bytes
+      - CORS_ORIGINS=["http://localhost:3000","http://localhost:5173"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend/app:/app/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Frontend (if exists)
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #     dockerfile: Dockerfile
+  #   container_name: openclaw-frontend
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - VITE_API_URL=http://localhost:8000
+  #   depends_on:
+  #     - backend
+
+volumes:
+  postgres_data:
+  redis_data:
