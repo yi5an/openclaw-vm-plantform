@@ -3,10 +3,12 @@ Agent management API endpoints.
 """
 from typing import List, Optional
 from datetime import datetime
+from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
-from pydantic import BaseModel, Field
+from sqlalchemy.exc import StatementError, DataError
+from pydantic import BaseModel, Field, ConfigDict
 from app.infrastructure.database.base import get_db
 from app.infrastructure.database.models import Agent, VM, Plan, AgentTemplate, AgentStatus
 from app.api.deps import get_current_active_user, get_pagination_params
@@ -31,14 +33,14 @@ class AgentCreateRequest(BaseModel):
     template_id: Optional[str] = Field(None, description="Template ID (optional)")
     name: str = Field(..., min_length=3, max_length=100, description="Agent name")
     system_prompt: str = Field(..., description="System prompt for the agent")
-    model_config: ModelConfig = Field(..., description="Model configuration")
+    llm_config: ModelConfig = Field(..., description="Model configuration")
 
 
 class AgentUpdateRequest(BaseModel):
     """Agent update request."""
     name: Optional[str] = Field(None, min_length=3, max_length=100)
     system_prompt: Optional[str] = None
-    model_config: Optional[ModelConfig] = None
+    llm_config: Optional[ModelConfig] = None
 
 
 class AgentResponse(BaseModel):
@@ -74,6 +76,27 @@ class TokenValidationResponse(BaseModel):
 
 
 # Helper functions
+def validate_uuid(resource_id: str, resource_name: str = "Resource") -> UUID:
+    """
+    Validate that a string is a valid UUID.
+    
+    Args:
+        resource_id: String to validate
+        resource_name: Name of the resource for error message
+        
+    Returns:
+        UUID object if valid
+        
+    Raises:
+        NotFoundError: If string is not a valid UUID
+    """
+    try:
+        return UUID(resource_id)
+    except (ValueError, AttributeError, TypeError):
+        # Invalid UUID format - treat as not found (don't leak implementation details)
+        raise NotFoundError(resource_name, resource_id)
+
+
 async def verify_vm_ownership(vm_id: str, user_id: str, db: AsyncSession) -> VM:
     """
     Verify that VM belongs to the user.
@@ -157,6 +180,11 @@ async def create_agent(
         ForbiddenError: If VM doesn't belong to user
         BadRequestError: If quota exceeded
     """
+    # Validate UUID format
+    validate_uuid(request.vm_id, "VM")
+    if request.template_id:
+        validate_uuid(request.template_id, "Agent Template")
+    
     # Verify VM ownership
     vm = await verify_vm_ownership(request.vm_id, str(current_user.id), db)
     
@@ -174,8 +202,8 @@ async def create_agent(
             raise NotFoundError("Agent Template", request.template_id)
     
     # Validate custom API key
-    if request.model_config.provider == "custom":
-        if not request.model_config.api_key:
+    if request.llm_config.provider == "custom":
+        if not request.llm_config.api_key:
             raise BadRequestError("API key is required for custom provider")
     
     # Create agent
@@ -185,7 +213,7 @@ async def create_agent(
         name=request.name,
         status=AgentStatus.CREATING,
         system_prompt=request.system_prompt,
-        model_config=request.model_config.dict(),
+        model_config=request.llm_config.dict(),
         messages_count=0
     )
     
@@ -241,6 +269,8 @@ async def list_agents(
     )
     
     if vm_id:
+        # Validate UUID format
+        validate_uuid(vm_id, "VM")
         # Verify VM ownership
         await verify_vm_ownership(vm_id, str(current_user.id), db)
         query = query.where(Agent.vm_id == vm_id)
@@ -300,8 +330,15 @@ async def get_agent(
         NotFoundError: If agent not found
         ForbiddenError: If agent's VM doesn't belong to user
     """
-    result = await db.execute(select(Agent).where(Agent.id == agent_id))
-    agent = result.scalar_one_or_none()
+    # Validate UUID format
+    validate_uuid(agent_id, "Agent")
+    
+    try:
+        result = await db.execute(select(Agent).where(Agent.id == agent_id))
+        agent = result.scalar_one_or_none()
+    except (StatementError, DataError) as e:
+        # Handle any database-level errors (e.g., invalid UUID format in query)
+        raise NotFoundError("Agent", agent_id)
     
     if not agent:
         raise NotFoundError("Agent", agent_id)
@@ -350,8 +387,15 @@ async def update_agent(
         ForbiddenError: If agent's VM doesn't belong to user
         BadRequestError: If trying to update running agent
     """
-    result = await db.execute(select(Agent).where(Agent.id == agent_id))
-    agent = result.scalar_one_or_none()
+    # Validate UUID format
+    validate_uuid(agent_id, "Agent")
+    
+    try:
+        result = await db.execute(select(Agent).where(Agent.id == agent_id))
+        agent = result.scalar_one_or_none()
+    except (StatementError, DataError) as e:
+        # Handle any database-level errors (e.g., invalid UUID format in query)
+        raise NotFoundError("Agent", agent_id)
     
     if not agent:
         raise NotFoundError("Agent", agent_id)
@@ -370,12 +414,12 @@ async def update_agent(
     if request.system_prompt is not None:
         agent.system_prompt = request.system_prompt
     
-    if request.model_config is not None:
+    if request.llm_config is not None:
         # Validate custom API key if changing to custom provider
-        if request.model_config.provider == "custom":
-            if not request.model_config.api_key:
+        if request.llm_config.provider == "custom":
+            if not request.llm_config.api_key:
                 raise BadRequestError("API key is required for custom provider")
-        agent.model_config = request.model_config.dict()
+        agent.model_config = request.llm_config.dict()
     
     agent.updated_at = datetime.utcnow()
     
@@ -421,8 +465,15 @@ async def start_agent(
         ForbiddenError: If agent's VM doesn't belong to user
         BadRequestError: If agent is already running or VM is not running
     """
-    result = await db.execute(select(Agent).where(Agent.id == agent_id))
-    agent = result.scalar_one_or_none()
+    # Validate UUID format
+    validate_uuid(agent_id, "Agent")
+    
+    try:
+        result = await db.execute(select(Agent).where(Agent.id == agent_id))
+        agent = result.scalar_one_or_none()
+    except (StatementError, DataError) as e:
+        # Handle any database-level errors (e.g., invalid UUID format in query)
+        raise NotFoundError("Agent", agent_id)
     
     if not agent:
         raise NotFoundError("Agent", agent_id)
@@ -482,8 +533,15 @@ async def stop_agent(
         ForbiddenError: If agent's VM doesn't belong to user
         BadRequestError: If agent is already stopped
     """
-    result = await db.execute(select(Agent).where(Agent.id == agent_id))
-    agent = result.scalar_one_or_none()
+    # Validate UUID format
+    validate_uuid(agent_id, "Agent")
+    
+    try:
+        result = await db.execute(select(Agent).where(Agent.id == agent_id))
+        agent = result.scalar_one_or_none()
+    except (StatementError, DataError) as e:
+        # Handle any database-level errors (e.g., invalid UUID format in query)
+        raise NotFoundError("Agent", agent_id)
     
     if not agent:
         raise NotFoundError("Agent", agent_id)
@@ -539,8 +597,15 @@ async def delete_agent(
         ForbiddenError: If agent's VM doesn't belong to user
         BadRequestError: If agent is running
     """
-    result = await db.execute(select(Agent).where(Agent.id == agent_id))
-    agent = result.scalar_one_or_none()
+    # Validate UUID format
+    validate_uuid(agent_id, "Agent")
+    
+    try:
+        result = await db.execute(select(Agent).where(Agent.id == agent_id))
+        agent = result.scalar_one_or_none()
+    except (StatementError, DataError) as e:
+        # Handle any database-level errors (e.g., invalid UUID format in query)
+        raise NotFoundError("Agent", agent_id)
     
     if not agent:
         raise NotFoundError("Agent", agent_id)
@@ -553,8 +618,13 @@ async def delete_agent(
         raise BadRequestError("Cannot delete running agent. Please stop it first.")
     
     # Delete agent (cascade delete will handle channels and token usages)
-    await db.delete(agent)
-    await db.commit()
+    try:
+        await db.delete(agent)
+        await db.commit()
+    except (StatementError, DataError) as e:
+        # Rollback on database errors
+        await db.rollback()
+        raise NotFoundError("Agent", agent_id)
     
     return success_response(
         {
