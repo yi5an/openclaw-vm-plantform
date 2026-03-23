@@ -31,13 +31,17 @@ class Settings(BaseSettings):
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     
     # Libvirt
+    ENABLE_LIBVIRT: bool = False  # 模拟模式开关
     LIBVIRT_URI: str = "qemu:///system"
     LIBVIRT_POOL_NAME: str = "openclaw-vms"
     LIBVIRT_NETWORK_NAME: str = "openclaw-network"
-    
+    LIBVIRT_CONNECT_TIMEOUT: int = 10  # 秒
+
     # SSH
     SSH_PRIVATE_KEY_PATH: str = "/root/.ssh/id_rsa"
     SSH_USER: str = "root"
+    SSH_CONNECT_TIMEOUT: int = 30  # 秒
+    SSH_DEPLOY_TIMEOUT: int = 600  # 秒（10分钟）
     
     # VM Configuration
     VM_BASE_IMAGE_PATH: str = "/var/lib/libvirt/images/base.qcow2"

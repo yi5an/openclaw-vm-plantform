@@ -3,18 +3,22 @@ Virtual Machine management API endpoints.
 """
 from typing import List, Optional
 from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException, status
+import asyncio
+import logging
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from pydantic import BaseModel, Field
 from app.infrastructure.database.base import get_db
 from app.infrastructure.database.models import VM, Plan, User, VMStatus
 from app.api.deps import get_current_active_user, get_pagination_params
-from app.core.exceptions import NotFoundError, BadRequestError, InsufficientBalanceError, ForbiddenError
+from app.core.exceptions import NotFoundError, BadRequestError, InsufficientBalanceError, ForbiddenError, VMOperationError
 from app.core.response import success_response, paginated_response
+from app.infrastructure.vm.libvirt_manager import libvirt_manager, VMSpec
+from app.infrastructure.vm.ssh_deployer import ssh_deployer, DeployConfig
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
-
 
 # Request/Response Models
 class PlanResponse(BaseModel):
@@ -93,6 +97,142 @@ class VMRenewRequest(BaseModel):
     months: int = Field(..., ge=1, le=12)
 
 
+# VM Provisioning Task (Background)
+async def provision_vm_task(
+    vm_id: str,
+    vm_name: str,
+    cpu: int,
+    memory: int,
+    disk: int,
+    user_id: str,
+    db_url: str
+):
+    """
+    Background task for VM provisioning.
+    
+    Steps:
+    1. Create VM in Libvirt
+    2. Start VM
+    3. Wait for IP assignment
+    4. Deploy OpenClaw via SSH
+    5. Update VM status in database
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+    from sqlalchemy.orm import sessionmaker
+    
+    logger.info(f"[VM Provisioning] Starting for VM {vm_id}")
+    
+    # Create database session
+    engine = create_async_engine(db_url)
+    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    
+    async with async_session() as db:
+        try:
+            # Get VM record
+            result = await db.execute(select(VM).where(VM.id == vm_id))
+            vm = result.scalar_one_or_none()
+            
+            if not vm:
+                logger.error(f"[VM Provisioning] VM {vm_id} not found in database")
+                return
+            
+            # Step 1: Create VM in Libvirt
+            logger.info(f"[VM Provisioning] Step 1/5: Creating VM in Libvirt")
+            spec = VMSpec(
+                name=vm_name,
+                cpu=cpu,
+                memory=memory,
+                disk=disk,
+                cloud_init_config={
+                    "hostname": vm_name,
+                    "users": [{
+                        "name": "root",
+                        "ssh_authorized_keys": []  # TODO: 从配置获取
+                    }]
+                }
+            )
+            
+            vm_info = await libvirt_manager.create_vm(spec)
+            vm.libvirt_domain_name = vm_info.name
+            await db.commit()
+            
+            logger.info(f"[VM Provisioning] VM created in Libvirt: {vm_info.id}")
+            
+            # Step 2: Start VM
+            logger.info(f"[VM Provisioning] Step 2/5: Starting VM")
+            await libvirt_manager.start_vm(vm_info.id)
+            
+            vm.status = VMStatus.RUNNING
+            vm.last_start_at = datetime.utcnow()
+            await db.commit()
+            
+            logger.info(f"[VM Provisioning] VM started successfully")
+            
+            # Step 3: Wait for IP assignment (max 60 seconds)
+            logger.info(f"[VM Provisioning] Step 3/5: Waiting for IP assignment")
+            ip_address = None
+            for attempt in range(12):  # 12 * 5s = 60s
+                try:
+                    await asyncio.sleep(5)
+                    ip_address = await libvirt_manager.get_vm_ip(vm_info.id)
+                    if ip_address:
+                        break
+                except Exception as e:
+                    logger.warning(f"[VM Provisioning] IP attempt {attempt + 1} failed: {e}")
+            
+            if not ip_address:
+                raise Exception("Failed to get VM IP address after 60 seconds")
+            
+            vm.ip_address = ip_address
+            await db.commit()
+            
+            logger.info(f"[VM Provisioning] IP assigned: {ip_address}")
+            
+            # Step 4: Deploy OpenClaw via SSH
+            logger.info(f"[VM Provisioning] Step 4/5: Deploying OpenClaw")
+            
+            # Wait for SSH to be ready
+            await asyncio.sleep(10)
+            
+            deploy_config = DeployConfig(
+                agents=[],
+                openclaw_version="latest",
+                install_docker=True
+            )
+            
+            deploy_result = await ssh_deployer.deploy_openclaw(
+                host=ip_address,
+                config=deploy_config
+            )
+            
+            if deploy_result["status"] != "success":
+                raise Exception(f"OpenClaw deployment failed: {deploy_result.get('error')}")
+            
+            logger.info(f"[VM Provisioning] OpenClaw deployed successfully")
+            
+            # Step 5: Verify deployment
+            logger.info(f"[VM Provisioning] Step 5/5: Verifying deployment")
+            
+            health = await ssh_deployer.check_openclaw_health(ip_address)
+            if not health["is_healthy"]:
+                logger.warning(f"[VM Provisioning] Health check failed, but VM is running")
+            
+            logger.info(f"[VM Provisioning] ✅ VM {vm_id} provisioning completed successfully")
+            
+        except Exception as e:
+            logger.error(f"[VM Provisioning] ❌ Failed to provision VM {vm_id}: {e}")
+            
+            # Update VM status to ERROR
+            try:
+                result = await db.execute(select(VM).where(VM.id == vm_id))
+                vm = result.scalar_one_or_none()
+                if vm:
+                    vm.status = VMStatus.ERROR
+                    await db.commit()
+            except Exception as db_error:
+                logger.error(f"[VM Provisioning] Failed to update VM status: {db_error}")
+
+
 # Plan endpoints
 @router.get("/plans")
 async def list_plans(
@@ -137,6 +277,7 @@ async def list_plans(
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_vm(
     request: VMCreateRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -145,6 +286,7 @@ async def create_vm(
     
     Args:
         request: VM creation request
+        background_tasks: FastAPI background tasks
         current_user: Current authenticated user
         db: Database session
         
@@ -195,11 +337,25 @@ async def create_vm(
     db.add(vm)
     
     # TODO: Deduct balance and create order
-    # TODO: Trigger Libvirt VM creation
-    # TODO: Deploy OpenClaw agent
     
     await db.commit()
     await db.refresh(vm)
+    
+    # Start background provisioning task
+    from app.core.config import settings
+    
+    background_tasks.add_task(
+        provision_vm_task,
+        str(vm.id),
+        vm.name,
+        vm.cpu,
+        vm.memory,
+        vm.disk,
+        str(current_user.id),
+        settings.DATABASE_URL
+    )
+    
+    logger.info(f"VM creation initiated: {vm.id} (user: {current_user.id})")
     
     vm_data = VMResponse(
         id=str(vm.id),
@@ -222,7 +378,7 @@ async def create_vm(
         expires_at=vm.expires_at.isoformat()
     )
     
-    return success_response(vm_data.dict(), "VM creation initiated")
+    return success_response(vm_data.dict(), "VM creation initiated. Provisioning in background.")
 
 
 @router.get("")
@@ -327,7 +483,7 @@ async def get_vm(
     plan_result = await db.execute(select(Plan).where(Plan.id == vm.plan_id))
     plan = plan_result.scalar_one()
     
-    # TODO: Get real usage data from Libvirt
+    # Get real usage data from Libvirt
     usage = {
         "cpu_percent": 0.0,
         "memory_percent": 0.0,
@@ -335,6 +491,15 @@ async def get_vm(
         "network_in_bytes": 0,
         "network_out_bytes": 0
     }
+    
+    try:
+        if vm.libvirt_domain_name and vm.status == VMStatus.RUNNING:
+            vm_status = await libvirt_manager.get_vm_status(str(vm.id))
+            usage["cpu_percent"] = vm_status["cpu_percent"]
+            usage["memory_percent"] = vm_status["memory_percent"]
+            # TODO: Add disk and network metrics
+    except Exception as e:
+        logger.warning(f"Failed to get VM usage data: {e}")
     
     vm_data = VMDetailResponse(
         id=str(vm.id),
@@ -425,15 +590,32 @@ async def stop_vm(
     if vm.user_id != current_user.id:
         raise ForbiddenError("You don't have access to this VM")
     
-    # TODO: Implement Libvirt stop operation
+    if vm.status == VMStatus.STOPPED:
+        raise BadRequestError("VM is already stopped")
     
-    operation_data = VMOperationResponse(
-        id=str(vm.id),
-        status="stopping",
-        message="虚拟机正在停止"
-    )
-    
-    return success_response(operation_data.dict(), "VM stop operation initiated")
+    try:
+        # Call Libvirt to stop VM
+        if vm.libvirt_domain_name:
+            await libvirt_manager.stop_vm(str(vm.id))
+        
+        # Update database status
+        vm.status = VMStatus.STOPPED
+        vm.last_stop_at = datetime.utcnow()
+        await db.commit()
+        
+        logger.info(f"VM {vm_id} stopped successfully")
+        
+        operation_data = VMOperationResponse(
+            id=str(vm.id),
+            status="stopped",
+            message="虚拟机已停止"
+        )
+        
+        return success_response(operation_data.dict(), "VM stopped successfully")
+        
+    except Exception as e:
+        logger.error(f"Failed to stop VM {vm_id}: {e}")
+        raise VMOperationError("stop", str(e))
 
 
 @router.delete("/{vm_id}")
@@ -521,4 +703,5 @@ async def renew_vm(
         "new_balance": float(current_user.balance) - cost
     }
     
+
     return success_response(renewal_data, "VM renewed successfully")
