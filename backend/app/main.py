@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 
 from app.core.config import settings
 from app.core.exceptions import setup_exception_handlers
-from app.api.v1 import auth, users, vms, agents
+from app.api.v1 import auth, users, vms, agents, channels
 from app.infrastructure.database.base import init_db, close_db
 from app.infrastructure.cache.redis_client import redis_client
 
@@ -118,6 +118,12 @@ app.include_router(
     agents.router,
     prefix=f"{settings.API_V1_PREFIX}/agents",
     tags=["Agent"]
+)
+
+app.include_router(
+    channels.router,
+    prefix=f"{settings.API_V1_PREFIX}/channels",
+    tags=["渠道"]
 )
 
 
